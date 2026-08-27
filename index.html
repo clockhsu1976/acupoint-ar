@@ -43,6 +43,16 @@
     position: absolute; left: 0; right: 0; bottom: 0; padding: 8px 12px;
     background: rgba(0,0,0,.55); font-size: .85rem; color: var(--dim);
   }
+  #parts {
+    display: flex; gap: 6px; width: min(92vw, 860px);
+    background: var(--panel); border-radius: 10px; padding: 4px;
+  }
+  #parts .part {
+    flex: 1; background: none; border: none; color: var(--dim);
+    border-radius: 8px; padding: 9px 0; font-size: .92rem; cursor: pointer;
+    font-family: inherit;
+  }
+  #parts .part.active { background: #2c3540; color: var(--text); font-weight: 600; }
   #symptoms {
     display: flex; gap: 8px; width: min(92vw, 860px);
     overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch;
@@ -82,7 +92,12 @@
 </style>
 </head>
 <body>
-<h1>穴位快找<small>手部穴位・依症狀取穴</small></h1>
+<h1>穴位快找<small id="subtitle">手部穴位・依症狀取穴</small></h1>
+
+<div id="parts">
+  <button class="part active" data-part="hand">✋ 手部</button>
+  <button class="part" data-part="foot">🦶 足部</button>
+</div>
 
 <div id="symptoms"></div>
 
@@ -107,7 +122,7 @@
 </p>
 
 <script type="module">
-import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import { HandLandmarker, PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
 // ---- 資料層：穴位定位公式（機器可讀，正式版抽成 JSON DB）----
 // 手部關鍵點索引：0 腕、2 拇指掌指、5 食指掌指、9 中指掌指
@@ -221,6 +236,71 @@ const ACUPOINTS = [
   }
 ];
 
+// ---- 足部座標系：以 heel→toe 為長軸、法向量指向內側，穴位用比例定位 ----
+// Pose 關鍵點：25/26 膝、27/28 踝、29/30 跟、31/32 趾（每腳僅 3 點，故用比例框架而非逐點插值）
+const FOOT_IDX = {
+  left:  { knee: 25, ankle: 27, heel: 29, toe: 31 },
+  right: { knee: 26, ankle: 28, heel: 30, toe: 32 }
+};
+const MEDIAL_SIGN = 1;   // 內側法向量方向，待真人照片實測校準
+
+function footFrame(pose, sideKey) {
+  const i = FOOT_IDX[sideKey];
+  const ankle = pose[i.ankle], heel = pose[i.heel], toe = pose[i.toe], knee = pose[i.knee];
+  const vx = toe.x - heel.x, vy = toe.y - heel.y;
+  const len = Math.hypot(vx, vy) || 1e-6;
+  const ux = vx / len, uy = vy / len;                       // 單位長軸（跟→趾）
+  const s = (sideKey === "left" ? 1 : -1) * MEDIAL_SIGN;
+  const nx = -uy * s, ny = ux * s;                          // 單位法向量（指向內側）
+  return {
+    ankle, heel, toe, knee, len,
+    // 足部：沿長軸 t（0=跟、1=趾），法向 m（腳長為單位，正=內側）
+    at: (t, m = 0) => ({ x: heel.x + ux * len * t + nx * len * m,
+                         y: heel.y + uy * len * t + ny * len * m }),
+    // 小腿：踝→膝方向 d（1=膝），法向 m
+    up: (d, m = 0) => ({ x: ankle.x + (knee.x - ankle.x) * d + nx * len * m,
+                         y: ankle.y + (knee.y - ankle.y) * d + ny * len * m })
+  };
+}
+
+// 足部穴位。係數為骨度分寸換算的估計值，精度低於手部（每腳僅 3 個關鍵點）
+const FOOTPOINTS = [
+  { id: "LR3", name: "太衝", color: "#ff6b6b",
+    ind: "頭痛、眩暈、目赤、情緒煩躁、經痛",
+    loc: "足背第一、二蹠骨結合部前方凹陷處",
+    calc: f => f.at(0.72, 0.055) },
+  { id: "ST41", name: "解谿", color: "#ffd166",
+    ind: "踝關節痛、足下垂、頭痛、腹脹",
+    loc: "足背踝關節橫紋中央，兩肌腱之間",
+    calc: f => f.at(0.30, 0) },
+  { id: "ST44", name: "內庭", color: "#f78c6c",
+    ind: "牙痛、咽喉腫痛、胃熱、腹脹",
+    loc: "足背第二、三趾間，趾蹼緣後方赤白肉際",
+    calc: f => f.at(0.88, 0.01) },
+  { id: "GB40", name: "丘墟", color: "#82aaff",
+    ind: "踝扭傷、脅痛、目赤",
+    loc: "外踝前下方，趾長伸肌腱外側凹陷處",
+    calc: f => f.at(0.32, -0.10) },
+  { id: "BL60", name: "崑崙", color: "#89ddff",
+    ind: "頭痛項強、腰背痛、踝關節痛",
+    loc: "外踝尖與跟腱之間凹陷處",
+    calc: f => f.at(0.13, -0.10) },
+  { id: "KI3", name: "太谿", color: "#4fc3a1",
+    ind: "耳鳴、失眠、腰痛、咽乾",
+    loc: "內踝尖與跟腱之間凹陷處",
+    calc: f => f.at(0.13, 0.10) },
+  { id: "SP6", name: "三陰交", color: "#c3e88d",
+    ind: "婦科諸症、失眠、消化不良（孕婦禁按）",
+    loc: "內踝尖上 3 寸，脛骨內側緣後方",
+    needsKnee: true,
+    calc: f => f.up(0.23, 0.055) },
+  { id: "ST36", name: "足三里", color: "#c792ea",
+    ind: "胃痛、消化不良、疲勞、增強體力",
+    loc: "犢鼻下 3 寸，脛骨前緣外一橫指",
+    needsKnee: true,
+    calc: f => f.up(0.81, -0.06) }
+];
+
 // ---- 掌背面判別：腕→食指根 × 腕→小指根 的外積符號，配合左右手 ----
 // 慣例校準：以使用者左手手背照實測（flipLabel 見校準紀錄）
 const PALM_RULE = { flipLabel: false };
@@ -239,27 +319,40 @@ function handSide(lm, label) {
 const SIDE_ZH = { palm: "掌面", dorsum: "手背面" };
 
 // ---- 症狀 → 穴位（先選症狀，只標對應穴位）----
+// ids 跨部位（手 + 腳），顯示時依當前部位過濾
 const SYMPTOMS = [
-  { key: "headache", name: "頭痛", ids: ["LI4", "TE5", "TE3", "LI5"] },
-  { key: "insomnia", name: "失眠", ids: ["HT7", "PC7", "PC6"] },
-  { key: "nausea", name: "噁心暈車", ids: ["PC6"] },
+  { key: "headache", name: "頭痛", ids: ["LI4", "TE5", "TE3", "LI5", "LR3", "BL60"] },
+  { key: "insomnia", name: "失眠", ids: ["HT7", "PC7", "PC6", "KI3", "SP6"] },
+  { key: "nausea", name: "噁心暈車", ids: ["PC6", "ST36"] },
   { key: "palpitation", name: "心悸", ids: ["PC6", "HT7", "PC8", "HT8"] },
-  { key: "stiffneck", name: "落枕頸痛", ids: ["EX-UE8", "SI3"] },
-  { key: "sorethroat", name: "咽喉痛", ids: ["LU11", "LI1", "LU10"] },
+  { key: "stiffneck", name: "落枕頸痛", ids: ["EX-UE8", "SI3", "BL60"] },
+  { key: "sorethroat", name: "咽喉痛", ids: ["LU11", "LI1", "LU10", "ST44"] },
   { key: "cough", name: "咳嗽", ids: ["LU9", "LU10", "LU11"] },
+  { key: "stomach", name: "胃痛消化", ids: ["PC6", "ST36", "ST44"] },
+  { key: "fatigue", name: "疲勞", ids: ["ST36", "LI4"] },
+  { key: "period", name: "經痛婦科", ids: ["SP6", "LR3"] },
   { key: "wristpain", name: "手腕痛", ids: ["TE4", "LI5", "TE5", "LU9", "PC7"] },
-  { key: "tinnitus", name: "耳鳴", ids: ["TE3", "TE5"] },
-  { key: "toothache", name: "牙痛", ids: ["LI4"] },
+  { key: "anklepain", name: "腳踝痛", ids: ["GB40", "ST41", "BL60", "KI3"] },
+  { key: "tinnitus", name: "耳鳴", ids: ["TE3", "TE5", "KI3"] },
+  { key: "toothache", name: "牙痛", ids: ["LI4", "ST44"] },
   { key: "cold", name: "感冒", ids: ["LI4", "TE5", "LI1"] },
   { key: "all", name: "全部穴位", ids: null }
 ];
+
+let PART = "hand";          // "hand" | "foot"
+const POINT_SETS = { hand: () => ACUPOINTS, foot: () => FOOTPOINTS };
+const PART_ZH = { hand: "手部", foot: "足部" };
 let activeSymptom = null;   // 預設未選：先選症狀才標點
-function getActivePoints() {
+
+function pointsFor(part) {
   if (!activeSymptom) return [];
   const s = SYMPTOMS.find(s => s.key === activeSymptom);
   if (!s) return [];
-  return s.ids === null ? ACUPOINTS : ACUPOINTS.filter(p => s.ids.includes(p.id));
+  const pool = POINT_SETS[part]();
+  return s.ids === null ? pool : pool.filter(p => s.ids.includes(p.id));
 }
+function getActivePoints() { return pointsFor(PART); }
+function otherPart() { return PART === "hand" ? "foot" : "hand"; }
 
 // 骨架連線（除錯顯示用）
 const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[0,17],[17,18],[18,19],[19,20]];
@@ -273,12 +366,21 @@ const fileInput = document.getElementById("fileInput");
 
 function renderLegend() {
   const pool = getActivePoints();
-  document.getElementById("legend").innerHTML = pool.length
+  const other = pointsFor(otherPart());
+  let html = pool.length
     ? pool.map(p =>
       `<div class="pt"><b><span class="dot" style="background:${p.color}"></span>${p.name} ${p.id}</b>
-       <span class="ind">（${p.side === "palm" ? "掌側" : "背側"}）</span><br>
+       <span class="ind">${p.side ? `（${p.side === "palm" ? "掌側" : "背側"}）` : ""}</span><br>
        <span class="ind">主治：${p.ind}<br>定位：${p.loc}</span></div>`).join("")
-    : `<div class="pt"><span class="ind">選擇上方症狀後，這裡會列出對應穴位與說明</span></div>`;
+    : `<div class="pt"><span class="ind">${activeSymptom
+        ? `${PART_ZH[PART]}沒有對應這個症狀的穴位`
+        : "選擇上方症狀後，這裡會列出對應穴位與說明"}</span></div>`;
+  // 跨部位提示：同一症狀常常手腳都有穴
+  if (other.length) {
+    html += `<div class="pt"><span class="ind">${PART_ZH[otherPart()]}也有：${
+      other.map(p => p.name).join("、")}（點上方切換）</span></div>`;
+  }
+  document.getElementById("legend").innerHTML = html;
 }
 
 function renderChips() {
@@ -293,6 +395,26 @@ document.getElementById("symptoms").addEventListener("click", e => {
   renderLegend();
   if (mode === "photo" && photoImg) detectPhoto(photoImg);
 });
+document.getElementById("parts").addEventListener("click", async e => {
+  const part = e.target.dataset?.part;
+  if (!part || part === PART) return;
+  PART = part;
+  document.querySelectorAll("#parts .part")
+    .forEach(b => b.classList.toggle("active", b.dataset.part === part));
+  document.getElementById("subtitle").textContent = `${PART_ZH[part]}穴位・依症狀取穴`;
+  renderLegend();
+  smoothState.clear();
+  try {
+    if (part === "foot") await loadPose();
+    if (mode === "live" && rafId) await activeDetector().setOptions({ runningMode: "VIDEO" });
+    else if (mode === "photo" && photoImg) await detectPhoto(photoImg);
+    else statusEl.textContent = `${PART_ZH[part]}模式就緒：選好症狀後按「即時鏡頭」或「上傳照片測試」`;
+  } catch (err) {
+    statusEl.textContent = "切換部位失敗：" + err.message;
+    console.error(err);
+  }
+});
+
 renderChips();
 renderLegend();
 
@@ -312,9 +434,19 @@ let photoImg = null;
 let stream = null;
 let rafId = null;
 
+let poseLandmarker = null;
+let visionFileset = null;
+
+async function getVision() {
+  if (!visionFileset) {
+    visionFileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  }
+  return visionFileset;
+}
+
 async function loadModel() {
-  const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const vision = await getVision();
   handLandmarker = await HandLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
@@ -327,6 +459,28 @@ async function loadModel() {
   });
   statusEl.textContent = "模型就緒。選擇「即時鏡頭」或「上傳照片測試」";
 }
+
+// 足部模型較大，切到足部才載
+async function loadPose() {
+  if (poseLandmarker) return poseLandmarker;
+  statusEl.textContent = "載入足部模型中…（約 10MB，第一次較久）";
+  const vision = await getVision();
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+    minPoseDetectionConfidence: 0.5,
+    minPosePresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+  return poseLandmarker;
+}
+
+// 目前部位對應的偵測器（切換模式時兩個模型都要同步 runningMode）
+function activeDetector() { return PART === "foot" ? poseLandmarker : handLandmarker; }
 
 function fitCanvas() {
   if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
@@ -484,6 +638,78 @@ function drawHands(result, toCanvas, useSmoothing) {
   return { drawn, notes };
 }
 
+// ---- 足部繪製：每腳僅 3 個關鍵點，改用「跟→趾長軸 + 內外側法向」比例框架 ----
+const FOOT_ZH = { left: "左腳", right: "右腳" };
+const LEG_BONES = [[25, 27], [26, 28], [27, 29], [28, 30], [29, 31], [30, 32], [27, 31], [28, 32]];
+
+function drawFeet(result, toCanvas, useSmoothing) {
+  const poses = result?.landmarks ?? [];
+  if (!poses.length) { smoothState.clear(); return { drawn: 0, notes: [] }; }
+  const notes = [];
+  const boxes = [];
+  let drawn = 0;
+  const pool = getActivePoints();
+
+  poses.forEach((pose, pi) => {
+    // 在畫布像素空間建座標系：正規化座標的 x/y 尺度不同，法向量會失真
+    const px = pose.map(toCanvas);
+
+    for (const sideKey of ["left", "right"]) {
+      const i = FOOT_IDX[sideKey];
+      const vis = k => pose[k]?.visibility ?? 0;
+      if (Math.min(vis(i.ankle), vis(i.heel), vis(i.toe)) < 0.5) continue;   // 這隻腳沒看清就不標
+      drawn++;
+      if (!pool.length) continue;
+
+      const f = footFrame(px, sideKey);
+      if (!(f.len > 12)) continue;                    // 腳太小，插值誤差過大
+      const r = Math.max(5, f.len * 0.06);
+      const labelPx = Math.max(12, f.len * 0.085);
+
+      // 小腿穴位要膝蓋入鏡才算得出骨度
+      const hasKnee = vis(i.knee) >= 0.5;
+      const visible = pool.filter(p => hasKnee || !p.needsKnee);
+      const needKnee = pool.filter(p => p.needsKnee && !hasKnee);
+      if (needKnee.length) {
+        notes.push(`膝蓋未入鏡，${needKnee.map(p => p.name).join("、")}無法定位（請讓小腿到腳一起入鏡）`);
+      }
+      if (!visible.length) continue;
+
+      if (skeletonToggle.checked) {
+        ctx.strokeStyle = "rgba(255,255,255,0.3)"; ctx.lineWidth = 2;
+        for (const [a, b] of LEG_BONES) {
+          if (vis(a) < 0.5 || vis(b) < 0.5) continue;
+          ctx.beginPath(); ctx.moveTo(px[a].x, px[a].y); ctx.lineTo(px[b].x, px[b].y); ctx.stroke();
+        }
+      }
+
+      // 腳跟旁標示左右腳
+      const sidePx = labelPx * 0.9;
+      ctx.font = labelFont(sidePx);
+      ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      const st = FOOT_ZH[sideKey], sx = f.heel.x + 8, sy = f.heel.y + sidePx;
+      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(st, sx, sy);
+      ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fillText(st, sx, sy);
+      boxes.push({ x1: sx, y1: sy - sidePx * 0.8, x2: sx + ctx.measureText(st).width, y2: sy + sidePx * 0.8 });
+
+      const items = visible.map(p => {
+        const raw = p.calc(f);
+        return { p, pos: useSmoothing ? smooth(`${pi}-${sideKey}-${p.id}`, raw) : raw };
+      });
+      for (const it of items) {
+        it.place = placeLabel(it.p.name, it.pos, r, labelPx, boxes);
+        boxes.push(it.place.box);
+      }
+      for (const it of items) drawLabel(it.p.name, it.pos, it.place, it.p.color, labelPx);
+      for (const it of items) drawPoint(it.pos, it.p.color, r);
+    }
+  });
+
+  if (drawn && !pool.length) notes.push("請先在上方選擇症狀");
+  if (drawn) notes.push("穴位在腳背與踝側，請讓腳背朝鏡頭");
+  return { drawn, notes };
+}
+
 // ---- 引導輪廓：沒偵測到手時顯示，導引使用者把部位放進畫面 ----
 let guidePhase = 0;
 function drawGuide() {
@@ -509,13 +735,15 @@ function drawGuide() {
   ctx.globalAlpha = pulse;
   ctx.font = `${Math.round(Math.min(rh * 0.62, rw * 0.9))}px -apple-system, "Apple Color Emoji", sans-serif`;
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
-  ctx.fillText("🖐", cw / 2, ry + rh * 0.46);
+  ctx.fillText(PART === "foot" ? "🦵" : "🖐", cw / 2, ry + rh * 0.46);
   ctx.globalAlpha = 1;
 
   // 提示文字
   const fs = Math.max(14, Math.min(ch * 0.034, rw * 0.075));
   ctx.font = `600 ${fs}px -apple-system, "PingFang TC", sans-serif`;
-  const hint = "把手放進框內，掌心或手背正對鏡頭";
+  const hint = PART === "foot"
+    ? "讓小腿到腳一起入鏡，腳背朝鏡頭"
+    : "把手放進框內，掌心或手背正對鏡頭";
   const hx = cw / 2, hy = ry + rh - fs * 1.2;   // 框內底部，避免壓到狀態列
   ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(hint, hx, hy);
   ctx.fillStyle = "rgba(255,255,255,0.95)"; ctx.fillText(hint, hx, hy);
@@ -528,12 +756,13 @@ function drawGuide() {
 let facing = "environment";
 let mirrorLive = false;      // 前鏡頭才鏡像顯示
 async function startLive() {
-  if (!handLandmarker) return;
+  if (PART === "foot") await loadPose();
+  if (!activeDetector()) return;
   stopAll();
   mode = "live";
   video.classList.remove("hidden");
   try {
-    await handLandmarker.setOptions({ runningMode: "VIDEO" });
+    await activeDetector().setOptions({ runningMode: "VIDEO" });
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 960 } }
     });
@@ -543,7 +772,8 @@ async function startLive() {
     video.classList.toggle("mirrored", mirrorLive);
     video.srcObject = stream;
     video.addEventListener("loadeddata", () => {
-      statusEl.textContent = "請把手掌或手背舉到鏡頭前";
+      statusEl.textContent = PART === "foot"
+        ? "請讓小腿到腳一起入鏡" : "請把手掌或手背舉到鏡頭前";
       rafId = requestAnimationFrame(liveLoop);
     }, { once: true });
   } catch (err) {
@@ -558,16 +788,21 @@ function liveLoop() {
   fitCanvas();
   if (video.currentTime !== lastVideoTime && video.videoWidth) {
     lastVideoTime = video.currentTime;
-    const result = handLandmarker.detectForVideo(video, performance.now());
+    const det = activeDetector();
+    if (!det) { rafId = requestAnimationFrame(liveLoop); return; }
+    const result = det.detectForVideo(video, performance.now());
     lastResult = result;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const map = makeMapper(video.videoWidth, video.videoHeight, "cover", mirrorLive);
-    const res = drawHands(result, map, true);
+    const res = PART === "foot" ? drawFeet(result, map, true) : drawHands(result, map, true);
     if (res.drawn) {
-      statusEl.textContent = `偵測到 ${res.drawn} 隻手 · ${res.notes.join("；")}`;
+      const unit = PART === "foot" ? "隻腳" : "隻手";
+      statusEl.textContent = `偵測到 ${res.drawn} ${unit} · ${res.notes.join("；")}`;
     } else {
       drawGuide();
-      statusEl.textContent = "請把手放進畫面中的引導框";
+      statusEl.textContent = PART === "foot"
+        ? "請讓小腿到腳一起入鏡（腳的偵測需要看到部分身體）"
+        : "請把手放進畫面中的引導框";
     }
   }
   rafId = requestAnimationFrame(liveLoop);
@@ -590,17 +825,22 @@ async function detectPhoto(img) {
       canvas.height = Math.max(1, Math.round(rect.height) || 645);
     }
   }
-  await handLandmarker.setOptions({ runningMode: "IMAGE" });
-  const result = handLandmarker.detect(img);
+  if (PART === "foot") await loadPose();
+  const det = activeDetector();
+  await det.setOptions({ runningMode: "IMAGE" });
+  const result = det.detect(img);
   lastResult = result;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const map = makeMapper(img.naturalWidth, img.naturalHeight, "contain", false);
   const o = map({ x: 0, y: 0 }), s = map({ x: 1, y: 1 });
   ctx.drawImage(img, o.x, o.y, s.x - o.x, s.y - o.y);
-  const res = drawHands(result, map, false);
+  const res = PART === "foot" ? drawFeet(result, map, false) : drawHands(result, map, false);
+  const unit = PART === "foot" ? "隻腳" : "隻手";
   statusEl.textContent = res.drawn
-    ? `照片中偵測到 ${res.drawn} 隻手 · ${res.notes.join("；")}`
-    : "照片中沒有偵測到手，換一張試試（手要清楚、光線足）";
+    ? `照片中偵測到 ${res.drawn} ${unit} · ${res.notes.join("；")}`
+    : (PART === "foot"
+        ? "照片中沒有偵測到腳。腳的偵測需要看到部分身體（模型靠軀幹定位），試試拍到大腿或坐姿全身"
+        : "照片中沒有偵測到手，換一張試試（手要清楚、光線足）");
 }
 
 function stopAll() {
