@@ -346,11 +346,68 @@ function makeMapper(srcW, srcH, fit, mirror) {
   });
 }
 
+// ---- 標籤防碰撞：量測實際大小，八方向由近而遠找空位，找不到才退回近處 ----
+const hits = (a, b) => !(a.x2 < b.x1 || a.x1 > b.x2 || a.y2 < b.y1 || a.y1 > b.y2);
+const LABEL_DIRS = [[1, 0], [-1, 0], [0, -1], [0, 1], [0.8, -0.8], [-0.8, -0.8], [0.8, 0.8], [-0.8, 0.8]];
+
+function labelFont(fontPx) {
+  return `600 ${fontPx}px -apple-system, "PingFang TC", sans-serif`;
+}
+
+function placeLabel(text, anchor, r, fontPx, boxes) {
+  ctx.font = labelFont(fontPx);
+  const bw = ctx.measureText(text).width + fontPx * 0.8;
+  const bh = fontPx * 1.56;
+  const gap = r + fontPx * 0.45;
+  let fallback = null;
+  for (const dist of [gap, gap + fontPx * 1.6, gap + fontPx * 3.2]) {
+    for (const [dx, dy] of LABEL_DIRS) {
+      const cx = anchor.x + dx * (dist + bw / 2), cy = anchor.y + dy * (dist + bh / 2);
+      const box = { x1: cx - bw / 2, y1: cy - bh / 2, x2: cx + bw / 2, y2: cy + bh / 2 };
+      if (box.x1 < 3 || box.y1 < 3 || box.x2 > canvas.width - 3 || box.y2 > canvas.height - 3) continue;
+      if (boxes.some(b => hits(box, b))) { fallback = fallback || { cx, cy, bw, bh, box }; continue; }
+      return { cx, cy, bw, bh, box };
+    }
+  }
+  // 完全找不到空位：擺在右側近處，至少不會消失
+  return fallback || (() => {
+    const cx = anchor.x + gap + bw / 2, cy = anchor.y;
+    return { cx, cy, bw, bh, box: { x1: cx - bw / 2, y1: cy - bh / 2, x2: cx + bw / 2, y2: cy + bh / 2 } };
+  })();
+}
+
+function drawLabel(text, anchor, pl, color, fontPx) {
+  // 引線：標籤被推遠時仍看得出對應哪個點
+  ctx.beginPath();
+  ctx.moveTo(anchor.x, anchor.y); ctx.lineTo(pl.cx, pl.cy);
+  ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1.5; ctx.stroke();
+  // 底板：深底提高對比，邊框用穴位色連結點與標籤
+  const rad = pl.bh * 0.35;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(pl.box.x1, pl.box.y1, pl.bw, pl.bh, rad);
+  else ctx.rect(pl.box.x1, pl.box.y1, pl.bw, pl.bh);
+  ctx.fillStyle = "rgba(8, 12, 15, 0.78)"; ctx.fill();
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+  // 文字
+  ctx.font = labelFont(fontPx);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#fff"; ctx.fillText(text, pl.cx, pl.cy);
+  ctx.textAlign = "left";
+}
+
+function drawPoint(pos, color, r) {
+  ctx.beginPath();
+  ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+  ctx.fillStyle = color + "dd"; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
+}
+
 function drawHands(result, toCanvas, useSmoothing) {
   const hands = result?.landmarks ?? [];
   if (!hands.length) { smoothState.clear(); return { drawn: 0, notes: [] }; }
   let drawn = 0;
   const notes = [];
+  const boxes = [];   // 已占用的標籤區域，跨雙手共用
 
   hands.forEach((lm, hi) => {
     // 信心閘門：手偵測分數不足就整隻不標，寧可不標不標錯
@@ -400,32 +457,29 @@ function drawHands(result, toCanvas, useSmoothing) {
       ? `${SIDE_ZH[side.name]}，翻手可見：${hidden.map(p => p.name).join("、")}`
       : SIDE_ZH[side.name]);
 
-    // 腕旁標示目前判定的手面
-    ctx.font = `600 ${fontPx * 0.85}px -apple-system, "PingFang TC", sans-serif`;
-    ctx.textBaseline = "middle";
-    ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)";
-    ctx.strokeText(SIDE_ZH[side.name], w.x + 10, w.y + fontPx);
-    ctx.fillStyle = "rgba(255,255,255,0.85)";
-    ctx.fillText(SIDE_ZH[side.name], w.x + 10, w.y + fontPx);
+    // 腕旁標示目前判定的手面（也占位，避免穴位標籤壓上來）
+    const sidePx = fontPx * 0.8;
+    ctx.font = labelFont(sidePx);
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    const sideText = SIDE_ZH[side.name];
+    const sx = w.x + 10, sy = w.y + fontPx;
+    const sw = ctx.measureText(sideText).width;
+    ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(sideText, sx, sy);
+    ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fillText(sideText, sx, sy);
+    boxes.push({ x1: sx, y1: sy - sidePx * 0.8, x2: sx + sw, y2: sy + sidePx * 0.8 });
 
-    visible.forEach((p, i) => {
+    // 兩階段：先為所有標籤找不重疊的位置，再依「引線→標籤→穴位點」順序畫，點在最上層
+    const labelPx = Math.max(12, palmPx * 0.105);
+    const items = visible.map(p => {
       const raw = toCanvas(p.calc(lm));
-      const pos = useSmoothing ? smooth(`${hi}-${p.id}`, raw) : raw;
-      ctx.beginPath();
-      ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = p.color + "cc";
-      ctx.fill();
-      ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
-      ctx.font = `600 ${Math.max(12, palmPx * 0.115)}px -apple-system, "PingFang TC", sans-serif`;
-      ctx.textBaseline = "middle";
-      // 標籤左右交錯，減少腕部密集區重疊
-      const left = i % 2 === 1;
-      ctx.textAlign = left ? "right" : "left";
-      const tx = left ? pos.x - r - 5 : pos.x + r + 5, ty = pos.y;
-      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(p.name, tx, ty);
-      ctx.fillStyle = "#fff"; ctx.fillText(p.name, tx, ty);
+      return { p, pos: useSmoothing ? smooth(`${hi}-${p.id}`, raw) : raw };
     });
-    ctx.textAlign = "left";
+    for (const it of items) {
+      it.place = placeLabel(it.p.name, it.pos, r, labelPx, boxes);
+      boxes.push(it.place.box);
+    }
+    for (const it of items) drawLabel(it.p.name, it.pos, it.place, it.p.color, labelPx);
+    for (const it of items) drawPoint(it.pos, it.p.color, r);
   });
   return { drawn, notes };
 }
