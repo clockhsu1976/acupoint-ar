@@ -1,0 +1,5 @@
+# 測試用的個人照片一律不進版控（公開 repo）
+test_*.jpg
+test_*.jpeg
+test_*.png
+*_result.jpg

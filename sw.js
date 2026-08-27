@@ -29,9 +29,10 @@ self.addEventListener("fetch", e => {
   }
 
   // 頁面本體：網路優先、離線退回快取
+  // no-store：不可經瀏覽器 HTTP 快取，否則改版後使用者會一直拿到舊頁面
   if (e.request.mode === "navigate" || url.endsWith("index.html")) {
     e.respondWith(
-      fetch(e.request).then(res => {
+      fetch(e.request, { cache: "no-store" }).then(res => {
         const copy = res.clone();
         caches.open(CACHE).then(c => c.put(e.request, copy));
         return res;

@@ -118,7 +118,7 @@
 <div id="legend"></div>
 
 <p class="note">
-  ⚠ 免責聲明：本工具為衛教與保健按摩參考，並非醫療器材，不提供診斷或治療建議。穴位定位以影像估算，誤差約 1–2 公分，僅適用於按壓保健，絕不可作為針灸進針依據。孕婦按壓合谷等穴位前請先諮詢中醫師；症狀持續或加劇請儘速就醫。影像僅在您的裝置上即時處理，不會上傳或儲存。
+  ⚠ 免責聲明：本工具為衛教與保健按摩參考，並非醫療器材，不提供診斷或治療建議。穴位定位以影像估算，僅適用於按壓保健，絕不可作為針灸進針依據。手部誤差約 1–2 公分；<b>足部因偵測關鍵點稀少，僅能標示概略範圍（虛線圈），請務必對照文字定位自行確認</b>。孕婦按壓合谷等穴位前請先諮詢中醫師；症狀持續或加劇請儘速就醫。影像僅在您的裝置上即時處理，不會上傳或儲存。
 </p>
 
 <script type="module">
@@ -244,19 +244,22 @@ const FOOT_IDX = {
 };
 const MEDIAL_SIGN = 1;   // 內側法向量方向，待真人照片實測校準
 
+// 實測（2026-08-27，使用者坐姿照）：MediaPipe 的 foot_index 落在「腳背中段」而非腳趾、
+// heel 落在踝下方而非腳跟後端。因此不能拿 heel→toe 當腳長，改以「踝→foot_index」為單位
+// 向量，需要更前面的位置就外推（d > 1）。
 function footFrame(pose, sideKey) {
   const i = FOOT_IDX[sideKey];
   const ankle = pose[i.ankle], heel = pose[i.heel], toe = pose[i.toe], knee = pose[i.knee];
-  const vx = toe.x - heel.x, vy = toe.y - heel.y;
-  const len = Math.hypot(vx, vy) || 1e-6;
-  const ux = vx / len, uy = vy / len;                       // 單位長軸（跟→趾）
+  const fx = toe.x - ankle.x, fy = toe.y - ankle.y;
+  const len = Math.hypot(fx, fy) || 1e-6;
+  const ux = fx / len, uy = fy / len;                        // 單位向量（踝→腳背中段）
   const s = (sideKey === "left" ? 1 : -1) * MEDIAL_SIGN;
-  const nx = -uy * s, ny = ux * s;                          // 單位法向量（指向內側）
+  const nx = -uy * s, ny = ux * s;                           // 單位法向量（指向內側，實測方向正確）
   return {
     ankle, heel, toe, knee, len,
-    // 足部：沿長軸 t（0=跟、1=趾），法向 m（腳長為單位，正=內側）
-    at: (t, m = 0) => ({ x: heel.x + ux * len * t + nx * len * m,
-                         y: heel.y + uy * len * t + ny * len * m }),
+    // 足部：d = 沿踝→趾方向的倍數（0=踝、1=foot_index、>1 往腳趾外推），m = 法向偏移（正=內側）
+    fwd: (d, m = 0) => ({ x: ankle.x + ux * len * d + nx * len * m,
+                          y: ankle.y + uy * len * d + ny * len * m }),
     // 小腿：踝→膝方向 d（1=膝），法向 m
     up: (d, m = 0) => ({ x: ankle.x + (knee.x - ankle.x) * d + nx * len * m,
                          y: ankle.y + (knee.y - ankle.y) * d + ny * len * m })
@@ -268,37 +271,38 @@ const FOOTPOINTS = [
   { id: "LR3", name: "太衝", color: "#ff6b6b",
     ind: "頭痛、眩暈、目赤、情緒煩躁、經痛",
     loc: "足背第一、二蹠骨結合部前方凹陷處",
-    calc: f => f.at(0.72, 0.055) },
+    calc: f => f.fwd(1.05, 0.06) },
   { id: "ST41", name: "解谿", color: "#ffd166",
     ind: "踝關節痛、足下垂、頭痛、腹脹",
     loc: "足背踝關節橫紋中央，兩肌腱之間",
-    calc: f => f.at(0.30, 0) },
+    calc: f => f.fwd(0.32, 0) },
   { id: "ST44", name: "內庭", color: "#f78c6c",
     ind: "牙痛、咽喉腫痛、胃熱、腹脹",
     loc: "足背第二、三趾間，趾蹼緣後方赤白肉際",
-    calc: f => f.at(0.88, 0.01) },
+    calc: f => f.fwd(1.50, 0.02) },
   { id: "GB40", name: "丘墟", color: "#82aaff",
     ind: "踝扭傷、脅痛、目赤",
     loc: "外踝前下方，趾長伸肌腱外側凹陷處",
-    calc: f => f.at(0.32, -0.10) },
+    calc: f => f.fwd(0.28, -0.28) },
   { id: "BL60", name: "崑崙", color: "#89ddff",
     ind: "頭痛項強、腰背痛、踝關節痛",
     loc: "外踝尖與跟腱之間凹陷處",
-    calc: f => f.at(0.13, -0.10) },
+    calc: f => f.fwd(0.08, -0.30) },
   { id: "KI3", name: "太谿", color: "#4fc3a1",
     ind: "耳鳴、失眠、腰痛、咽乾",
     loc: "內踝尖與跟腱之間凹陷處",
-    calc: f => f.at(0.13, 0.10) },
+    calc: f => f.fwd(0.08, 0.30) },
   { id: "SP6", name: "三陰交", color: "#c3e88d",
     ind: "婦科諸症、失眠、消化不良（孕婦禁按）",
     loc: "內踝尖上 3 寸，脛骨內側緣後方",
     needsKnee: true,
-    calc: f => f.up(0.23, 0.055) },
+    calc: f => f.up(0.18, 0.16) },
   { id: "ST36", name: "足三里", color: "#c792ea",
     ind: "胃痛、消化不良、疲勞、增強體力",
     loc: "犢鼻下 3 寸，脛骨前緣外一橫指",
+    // 犢鼻(髕骨下緣)比 pose 的膝關節中心低約 1 寸，故從膝往下取 4/16 而非 3/16
     needsKnee: true,
-    calc: f => f.up(0.81, -0.06) }
+    calc: f => f.up(0.75, -0.16) }
 ];
 
 // ---- 掌背面判別：腕→食指根 × 腕→小指根 的外積符號，配合左右手 ----
@@ -460,21 +464,29 @@ async function loadModel() {
   statusEl.textContent = "模型就緒。選擇「即時鏡頭」或「上傳照片測試」";
 }
 
-// 足部模型較大，切到足部才載
-async function loadPose() {
-  if (poseLandmarker) return poseLandmarker;
+// 足部模型較大，切到足部才載。用 promise 快取避免並行呼叫建出兩個模型
+let posePromise = null;
+function loadPose() {
+  if (poseLandmarker) return Promise.resolve(poseLandmarker);
+  if (!posePromise) posePromise = createPose().catch(err => { posePromise = null; throw err; });
+  return posePromise;
+}
+
+async function createPose() {
   statusEl.textContent = "載入足部模型中…（約 10MB，第一次較久）";
   const vision = await getVision();
   poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
     baseOptions: {
-      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+      // 用 full 不用 lite：實測 lite 對「無頭部的下半身照」完全偵測不到，full 可信度 0.97
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
       delegate: "GPU"
     },
     runningMode: "VIDEO",
     numPoses: 1,
-    minPoseDetectionConfidence: 0.5,
-    minPosePresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5
+    // 閾值放寬：下半身入鏡（無頭）時偵測分數本來就低，0.5 會整個偵測不到
+    minPoseDetectionConfidence: 0.25,
+    minPosePresenceConfidence: 0.25,
+    minTrackingConfidence: 0.25
   });
   return poseLandmarker;
 }
@@ -554,6 +566,18 @@ function drawPoint(pos, color, r) {
   ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
   ctx.fillStyle = color + "dd"; ctx.fill();
   ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
+}
+
+// 足部關鍵點只有 3 個、精度本就低，畫成「概略區域」而非精確點，視覺上不過度承諾
+function drawZone(pos, color, r) {
+  ctx.beginPath();
+  ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+  ctx.fillStyle = color + "44"; ctx.fill();
+  ctx.setLineDash([5, 4]); ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.arc(pos.x, pos.y, Math.max(2, r * 0.22), 0, Math.PI * 2);
+  ctx.fillStyle = color; ctx.fill();
 }
 
 function drawHands(result, toCanvas, useSmoothing) {
@@ -663,8 +687,8 @@ function drawFeet(result, toCanvas, useSmoothing) {
 
       const f = footFrame(px, sideKey);
       if (!(f.len > 12)) continue;                    // 腳太小，插值誤差過大
-      const r = Math.max(5, f.len * 0.06);
-      const labelPx = Math.max(12, f.len * 0.085);
+      const r = Math.max(5, f.len * 0.11);
+      const labelPx = Math.max(12, f.len * 0.16);
 
       // 小腿穴位要膝蓋入鏡才算得出骨度
       const hasKnee = vis(i.knee) >= 0.5;
@@ -701,12 +725,12 @@ function drawFeet(result, toCanvas, useSmoothing) {
         boxes.push(it.place.box);
       }
       for (const it of items) drawLabel(it.p.name, it.pos, it.place, it.p.color, labelPx);
-      for (const it of items) drawPoint(it.pos, it.p.color, r);
+      for (const it of items) drawZone(it.pos, it.p.color, r);
     }
   });
 
   if (drawn && !pool.length) notes.push("請先在上方選擇症狀");
-  if (drawn) notes.push("穴位在腳背與踝側，請讓腳背朝鏡頭");
+  if (drawn) notes.push("虛線圈為概略範圍（足部精度低於手部），請對照下方文字定位確認");
   return { drawn, notes };
 }
 
@@ -877,12 +901,19 @@ fileInput.addEventListener("change", () => {
 skeletonToggle.addEventListener("change", () => { if (mode === "photo" && photoImg) detectPhoto(photoImg); });
 // 開發測試掛鉤，只在 ?debug 時暴露
 if (new URLSearchParams(location.search).has("debug")) {
-  window.__debug = { detectPhoto, getMode: () => mode, last: () => lastResult, handSide, drawGuide, fitCanvas };
+  window.__debug = { detectPhoto, getMode: () => mode, last: () => lastResult, handSide, drawGuide, fitCanvas,
+                     pose: () => poseLandmarker, loadPose, footFrame, FOOTPOINTS };
 }
 
 // PWA：可加入主畫面、模型快取供離線使用
-if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
-  navigator.serviceWorker.register("./sw.js").catch(() => {});
+// debug 模式（開發用）反過來註銷 SW，否則快取會讓改版看不到效果
+if ("serviceWorker" in navigator) {
+  const dev = new URLSearchParams(location.search).has("debug");
+  if (dev) {
+    navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+  } else if (location.protocol === "https:" || location.hostname === "localhost") {
+    navigator.serviceWorker.register("./sw.js").catch(() => {});
+  }
 }
 
 loadModel()
