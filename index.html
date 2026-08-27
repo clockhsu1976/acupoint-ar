@@ -682,21 +682,16 @@ function drawFeet(result, toCanvas, useSmoothing) {
     // 在畫布像素空間建座標系：正規化座標的 x/y 尺度不同，法向量會失真
     const px = pose.map(toCanvas);
 
-    // 兩腿靠近時模型常把左右腳估到同一處，只留可信度較高的那隻，避免標記在兩腿間跳動
+    // 一次只標「最可信的那隻腳」。雙腿同框時 pose 常把左右腳估到同一條腿上（實測：
+    // 兩組穴位上下排在同一條小腿），距離檢查抓不到這種失效；而按摩本來就一次按一隻腳，
+    // 少標一隻的代價遠低於標錯腿。
     const vis = k => pose[k]?.visibility ?? 0;
     const footScore = s => Math.min(vis(FOOT_IDX[s].ankle), vis(FOOT_IDX[s].heel), vis(FOOT_IDX[s].toe));
-    let sides = ["left", "right"].filter(s => footScore(s) >= 0.65);   // 門檻提高：遮擋的腳不標
-    if (sides.length === 2) {
-      const dx = px[FOOT_IDX.left.ankle].x - px[FOOT_IDX.right.ankle].x;
-      const dy = px[FOOT_IDX.left.ankle].y - px[FOOT_IDX.right.ankle].y;
-      const apart = Math.hypot(dx, dy);
-      const footLen = Math.hypot(px[FOOT_IDX.left.toe].x - px[FOOT_IDX.left.ankle].x,
-                                 px[FOOT_IDX.left.toe].y - px[FOOT_IDX.left.ankle].y);
-      if (apart < footLen * 0.8) {                 // 兩腳踝幾乎重疊 = 誤判
-        sides = [footScore("left") >= footScore("right") ? "left" : "right"];
-        notes.push("兩腳距離太近難以分辨，只標示較清楚的那隻（建議一次對準一隻腳）");
-      }
-    }
+    const best = ["left", "right"]
+      .map(s => ({ s, v: footScore(s) }))
+      .filter(x => x.v >= 0.6)
+      .sort((a, b) => b.v - a.v)[0];
+    const sides = best ? [best.s] : [];
 
     for (const sideKey of sides) {
       const i = FOOT_IDX[sideKey];
@@ -725,20 +720,15 @@ function drawFeet(result, toCanvas, useSmoothing) {
         }
       }
 
-      // 腳跟旁標示左右腳
-      const sidePx = labelPx * 0.9;
-      ctx.font = labelFont(sidePx);
-      ctx.textAlign = "left"; ctx.textBaseline = "middle";
-      const st = FOOT_ZH[sideKey], sx = f.heel.x + 8, sy = f.heel.y + sidePx;
-      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(st, sx, sy);
-      ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fillText(st, sx, sy);
-      boxes.push({ x1: sx, y1: sy - sidePx * 0.8, x2: sx + ctx.measureText(st).width, y2: sy + sidePx * 0.8 });
+      // 不標「左腳/右腳」：單腳顯示下使用者自己知道拍的是哪隻，而模型搞混左右時
+      // 這個標籤反而給出錯誤資訊
 
       const items = visible.map(p => {
         const raw = p.calc(f);
-        // 足部關鍵點抖動遠大於手部：平滑更重，且抑制跨腿的大跳動
+        // 足部關鍵點抖動遠大於手部：平滑更重，且抑制跨腿的大跳動。
+        // 鍵值不含 sideKey——單腳顯示下模型的左右判定會搖擺，鍵跟著換會讓平滑重置
         return { p, pos: useSmoothing
-          ? smooth(`${pi}-${sideKey}-${p.id}`, raw, 0.22, f.len * 0.4) : raw };
+          ? smooth(`${pi}-foot-${p.id}`, raw, 0.22, f.len * 0.4) : raw };
       });
       for (const it of items) {
         it.place = placeLabel(it.p.name, it.pos, r, labelPx, boxes);
