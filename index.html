@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>穴位快找</title>
+<meta name="theme-color" content="#101418">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+  :root {
+    --bg: #101418; --panel: #1a2027; --text: #e8edf2; --dim: #93a1af;
+    --accent: #4fc3a1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 16px; gap: 12px;
+  }
+  h1 { font-size: 1.1rem; font-weight: 600; }
+  h1 small { color: var(--dim); font-weight: 400; margin-left: 8px; }
+  #stage {
+    position: relative; width: min(92vw, 860px); aspect-ratio: 4/3;
+    background: #000; border-radius: 12px; overflow: hidden;
+  }
+  /* 手機直拿：舞台放大到接近全螢幕，鏡頭畫面才夠大 */
+  @media (orientation: portrait) and (max-width: 700px) {
+    body { padding: 8px; gap: 8px; }
+    #stage { width: 96vw; height: 74vh; aspect-ratio: auto; }
+  }
+  #video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover;
+  }
+  #video.mirrored { transform: scaleX(-1); }   /* 只有前鏡頭要鏡像 */
+  #video.hidden { display: none; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #status {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 8px 12px;
+    background: rgba(0,0,0,.55); font-size: .85rem; color: var(--dim);
+  }
+  #symptoms {
+    display: flex; gap: 8px; width: min(92vw, 860px);
+    overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch;
+  }
+  #symptoms .chip {
+    flex: 0 0 auto; background: var(--panel); color: var(--dim);
+    border: 1px solid #2c3540; border-radius: 999px; padding: 7px 14px;
+    font-size: .85rem; cursor: pointer; white-space: nowrap;
+  }
+  #symptoms .chip.active {
+    background: var(--accent); color: #08211a; border-color: var(--accent); font-weight: 600;
+  }
+  #controls {
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    width: min(92vw, 860px); font-size: .82rem; color: var(--dim);
+  }
+  #controls label { user-select: none; cursor: pointer; }
+  #controls button {
+    background: var(--panel); color: var(--text); border: 1px solid #2c3540;
+    border-radius: 8px; padding: 6px 12px; font-size: .82rem; cursor: pointer;
+  }
+  #controls button:hover { border-color: var(--accent); }
+  #legend {
+    display: flex; flex-wrap: wrap; gap: 10px; width: min(92vw, 860px);
+  }
+  .pt {
+    background: var(--panel); border-radius: 10px; padding: 10px 14px;
+    flex: 1 1 240px; font-size: .88rem; line-height: 1.5;
+  }
+  .pt b { font-size: .95rem; }
+  .dot {
+    display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    margin-right: 6px; vertical-align: baseline;
+  }
+  .pt .ind { color: var(--dim); }
+  .note { color: var(--dim); font-size: .78rem; width: min(92vw, 860px); line-height: 1.6; }
+</style>
+</head>
+<body>
+<h1>穴位快找<small>手部穴位・依症狀取穴</small></h1>
+
+<div id="symptoms"></div>
+
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="status">載入模型中…</div>
+</div>
+
+<div id="controls">
+  <button id="btnLive">📷 即時鏡頭</button>
+  <button id="btnFlip">🔄 切換前後鏡頭</button>
+  <button id="btnPhoto">🖼 上傳照片測試</button>
+  <input type="file" id="fileInput" accept="image/*" hidden>
+  <label><input type="checkbox" id="showSkeleton"> 顯示手部偵測骨架</label>
+</div>
+
+<div id="legend"></div>
+
+<p class="note">
+  ⚠ 免責聲明：本工具為衛教與保健按摩參考，並非醫療器材，不提供診斷或治療建議。穴位定位以影像估算，誤差約 1–2 公分，僅適用於按壓保健，絕不可作為針灸進針依據。孕婦按壓合谷等穴位前請先諮詢中醫師；症狀持續或加劇請儘速就醫。影像僅在您的裝置上即時處理，不會上傳或儲存。
+</p>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---- 資料層：穴位定位公式（機器可讀，正式版抽成 JSON DB）----
+// 手部關鍵點索引：0 腕、2 拇指掌指、5 食指掌指、9 中指掌指
+const lerp = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+// 以「腕→中指掌指」反向外推：2寸 ≈ 掌長(腕至中指掌指) × 0.55
+const forearm2cun = lm => {
+  const dx = lm[0].x - lm[9].x, dy = lm[0].y - lm[9].y;
+  return { x: lm[0].x + dx * 0.55, y: lm[0].y + dy * 0.55 };
+};
+const mid = (a, b) => lerp(a, b, 0.5);
+// side: 穴位所在面（palm 掌側 / dorsum 背側），與當前手面不符就不顯示
+// 關鍵點索引：0腕 1拇CMC 2拇MCP 3拇IP 4拇尖 5食MCP 7食DIP 8食尖 9中MCP 13無名MCP 17小MCP
+const ACUPOINTS = [
+  // ---- 背側 ----
+  {
+    id: "LI4", name: "合谷", color: "#ff6b6b", side: "dorsum",
+    ind: "頭痛、牙痛、感冒、面口諸症",
+    loc: "手背第一、二掌骨間，第二掌骨橈側中點",
+    calc: lm => { const m = lerp(lm[2], lm[5], 0.5); return lerp(m, lm[0], 0.15); }
+  },
+  {
+    id: "TE5", name: "外關", color: "#7aa2ff", side: "dorsum",
+    ind: "頭痛、耳鳴、感冒發熱、手腕痛",
+    loc: "腕背橫紋上 2 寸，尺橈兩骨之間（與內關相對）",
+    calc: forearm2cun
+  },
+  {
+    id: "TE4", name: "陽池", color: "#c792ea", side: "dorsum",
+    ind: "手腕痛、目赤腫痛、口乾",
+    loc: "腕背橫紋中，指總伸肌腱尺側凹陷處",
+    calc: lm => lerp(lm[0], lm[13], 0.10)
+  },
+  {
+    id: "LI5", name: "陽谿", color: "#f78c6c", side: "dorsum",
+    ind: "手腕痛、頭痛、目赤腫痛",
+    loc: "腕背橫紋橈側，拇短伸肌腱與拇長伸肌腱之間凹陷（鼻煙窩）",
+    calc: lm => lerp(lm[0], lm[1], 0.45)
+  },
+  {
+    id: "TE3", name: "中渚", color: "#82aaff", side: "dorsum",
+    ind: "偏頭痛、耳鳴耳聾、肩背痛",
+    loc: "手背第四、五掌骨間，掌指關節後方凹陷處",
+    calc: lm => lerp(mid(lm[13], lm[17]), lm[0], 0.30)
+  },
+  {
+    id: "SI3", name: "後谿", color: "#89ddff", side: "dorsum",
+    ind: "落枕、頭項強痛、腰背痛",
+    loc: "第五掌骨小頭後方尺側，握拳掌橫紋頭處",
+    calc: lm => lerp(lm[17], lm[0], 0.18)
+  },
+  {
+    id: "EX-UE8", name: "外勞宮", color: "#ffcb6b", side: "dorsum",
+    ind: "落枕、頸項強痛、手背腫痛",
+    loc: "手背第二、三掌骨間，掌指關節後約 0.5 寸（落枕穴）",
+    calc: lm => lerp(mid(lm[5], lm[9]), lm[0], 0.15)
+  },
+  {
+    id: "LI1", name: "商陽", color: "#ff9e80", side: "dorsum",
+    ind: "咽喉腫痛、發熱、昏厥急救",
+    loc: "食指末節橈側，指甲角旁約 0.1 寸",
+    calc: lm => lerp(lm[7], lm[8], 0.8)
+  },
+  {
+    id: "LU11", name: "少商", color: "#f07178", side: "dorsum",
+    ind: "咽喉腫痛、咳嗽、昏厥急救",
+    loc: "拇指末節橈側，指甲角旁約 0.1 寸",
+    calc: lm => lerp(lm[3], lm[4], 0.8)
+  },
+  // ---- 掌側 ----
+  {
+    id: "PC8", name: "勞宮", color: "#ffd166", side: "palm",
+    ind: "心悸、心煩、口瘡、掌心熱",
+    loc: "掌心，第二、三掌骨之間，握拳中指尖處",
+    calc: lm => lerp(lm[0], lm[9], 0.70)
+  },
+  {
+    id: "PC6", name: "內關", color: "#4fc3a1", side: "palm",
+    ind: "噁心嘔吐、暈車、心悸、失眠",
+    loc: "腕橫紋上 2 寸，掌長肌腱與橈側腕屈肌腱之間",
+    calc: forearm2cun
+  },
+  {
+    id: "PC7", name: "大陵", color: "#c3e88d", side: "palm",
+    ind: "心痛心悸、胃痛、失眠",
+    loc: "腕掌橫紋中點，兩肌腱之間",
+    calc: lm => lerp(lm[0], lm[9], 0.05)
+  },
+  {
+    id: "HT7", name: "神門", color: "#b2ccd6", side: "palm",
+    ind: "失眠、健忘、心悸",
+    loc: "腕掌橫紋尺側端，尺側腕屈肌腱橈側凹陷處",
+    calc: lm => lerp(lm[0], lm[17], 0.18)
+  },
+  {
+    id: "LU9", name: "太淵", color: "#80cbc4", side: "palm",
+    ind: "咳嗽、氣喘、手腕痛",
+    loc: "腕掌橫紋橈側端，橈動脈搏動處",
+    calc: lm => lerp(lm[0], lm[1], 0.35)
+  },
+  {
+    id: "LU10", name: "魚際", color: "#e57373", side: "palm",
+    ind: "咳嗽、咽乾、失音",
+    loc: "第一掌骨中點橈側，赤白肉際處",
+    calc: lm => mid(lm[1], lm[2])
+  },
+  {
+    id: "HT8", name: "少府", color: "#ba68c8", side: "palm",
+    ind: "心悸、胸痛、掌心熱",
+    loc: "掌心第四、五掌骨之間，握拳小指尖處",
+    calc: lm => lerp(lm[0], mid(lm[13], lm[17]), 0.70)
+  }
+];
+
+// ---- 掌背面判別：腕→食指根 × 腕→小指根 的外積符號，配合左右手 ----
+// 慣例校準：以使用者左手手背照實測（flipLabel 見校準紀錄）
+const PALM_RULE = { flipLabel: false };
+function handSide(lm, label) {
+  const v1x = lm[5].x - lm[0].x, v1y = lm[5].y - lm[0].y;
+  const v2x = lm[17].x - lm[0].x, v2y = lm[17].y - lm[0].y;
+  const cross = v1x * v2y - v1y * v2x;
+  const norm = Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y) || 1;
+  const s = cross / norm;                       // ≈ sin(兩向量夾角)，帶符號
+  if (Math.abs(s) < 0.12) return { name: null, uncertain: true, s, label };
+  let isRight = label === "Right";
+  if (PALM_RULE.flipLabel) isRight = !isRight;
+  const palm = isRight ? s < 0 : s > 0;
+  return { name: palm ? "palm" : "dorsum", uncertain: false, s, label };
+}
+const SIDE_ZH = { palm: "掌面", dorsum: "手背面" };
+
+// ---- 症狀 → 穴位（先選症狀，只標對應穴位）----
+const SYMPTOMS = [
+  { key: "headache", name: "頭痛", ids: ["LI4", "TE5", "TE3", "LI5"] },
+  { key: "insomnia", name: "失眠", ids: ["HT7", "PC7", "PC6"] },
+  { key: "nausea", name: "噁心暈車", ids: ["PC6"] },
+  { key: "palpitation", name: "心悸", ids: ["PC6", "HT7", "PC8", "HT8"] },
+  { key: "stiffneck", name: "落枕頸痛", ids: ["EX-UE8", "SI3"] },
+  { key: "sorethroat", name: "咽喉痛", ids: ["LU11", "LI1", "LU10"] },
+  { key: "cough", name: "咳嗽", ids: ["LU9", "LU10", "LU11"] },
+  { key: "wristpain", name: "手腕痛", ids: ["TE4", "LI5", "TE5", "LU9", "PC7"] },
+  { key: "tinnitus", name: "耳鳴", ids: ["TE3", "TE5"] },
+  { key: "toothache", name: "牙痛", ids: ["LI4"] },
+  { key: "cold", name: "感冒", ids: ["LI4", "TE5", "LI1"] },
+  { key: "all", name: "全部穴位", ids: null }
+];
+let activeSymptom = null;   // 預設未選：先選症狀才標點
+function getActivePoints() {
+  if (!activeSymptom) return [];
+  const s = SYMPTOMS.find(s => s.key === activeSymptom);
+  if (!s) return [];
+  return s.ids === null ? ACUPOINTS : ACUPOINTS.filter(p => s.ids.includes(p.id));
+}
+
+// 骨架連線（除錯顯示用）
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[0,17],[17,18],[18,19],[19,20]];
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const skeletonToggle = document.getElementById("showSkeleton");
+const fileInput = document.getElementById("fileInput");
+
+function renderLegend() {
+  const pool = getActivePoints();
+  document.getElementById("legend").innerHTML = pool.length
+    ? pool.map(p =>
+      `<div class="pt"><b><span class="dot" style="background:${p.color}"></span>${p.name} ${p.id}</b>
+       <span class="ind">（${p.side === "palm" ? "掌側" : "背側"}）</span><br>
+       <span class="ind">主治：${p.ind}<br>定位：${p.loc}</span></div>`).join("")
+    : `<div class="pt"><span class="ind">選擇上方症狀後，這裡會列出對應穴位與說明</span></div>`;
+}
+
+function renderChips() {
+  document.getElementById("symptoms").innerHTML = SYMPTOMS.map(s =>
+    `<button class="chip${s.key === activeSymptom ? " active" : ""}" data-key="${s.key}">${s.name}</button>`).join("");
+}
+document.getElementById("symptoms").addEventListener("click", e => {
+  const key = e.target.dataset?.key;
+  if (!key) return;
+  activeSymptom = activeSymptom === key ? null : key;   // 再點一次取消
+  renderChips();
+  renderLegend();
+  if (mode === "photo" && photoImg) detectPhoto(photoImg);
+});
+renderChips();
+renderLegend();
+
+// ---- 對位層：平滑濾波（指數移動平均，抑制關鍵點抖動）----
+const smoothState = new Map();
+function smooth(key, pt, alpha = 0.4) {
+  const prev = smoothState.get(key);
+  const next = prev ? { x: prev.x + (pt.x - prev.x) * alpha, y: prev.y + (pt.y - prev.y) * alpha } : pt;
+  smoothState.set(key, next);
+  return next;
+}
+
+let handLandmarker = null;
+let lastResult = null;
+let mode = null;            // "live" | "photo"
+let photoImg = null;
+let stream = null;
+let rafId = null;
+
+async function loadModel() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 2,
+    minHandDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+  statusEl.textContent = "模型就緒。選擇「即時鏡頭」或「上傳照片測試」";
+}
+
+function fitCanvas() {
+  if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
+    canvas.width = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
+  }
+}
+
+// 來源(寬高)貼進畫布的座標換算；live 用 cover+鏡像，photo 用 contain 不鏡像
+function makeMapper(srcW, srcH, fit, mirror) {
+  const cw = canvas.width, ch = canvas.height;
+  const scale = fit === "cover" ? Math.max(cw / srcW, ch / srcH) : Math.min(cw / srcW, ch / srcH);
+  const offX = (cw - srcW * scale) / 2, offY = (ch - srcH * scale) / 2;
+  return pt => ({
+    x: mirror ? cw - (pt.x * srcW * scale + offX) : pt.x * srcW * scale + offX,
+    y: pt.y * srcH * scale + offY
+  });
+}
+
+function drawHands(result, toCanvas, useSmoothing) {
+  const hands = result?.landmarks ?? [];
+  if (!hands.length) { smoothState.clear(); return { drawn: 0, notes: [] }; }
+  let drawn = 0;
+  const notes = [];
+
+  hands.forEach((lm, hi) => {
+    // 信心閘門：手偵測分數不足就整隻不標，寧可不標不標錯
+    const hd = result.handednesses?.[hi]?.[0];
+    const score = hd?.score ?? 0;
+    if (score < 0.8) return;
+    drawn++;
+    const side = handSide(lm, hd?.categoryName ?? hd?.displayName);
+
+    if (skeletonToggle.checked) {
+      ctx.strokeStyle = "rgba(255,255,255,0.3)";
+      ctx.lineWidth = 2;
+      for (const [a, b] of BONES) {
+        const p1 = toCanvas(lm[a]), p2 = toCanvas(lm[b]);
+        ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+      }
+    }
+
+    // 以掌長決定標記尺寸，遠近一致
+    const w = toCanvas(lm[0]), m = toCanvas(lm[9]);
+    const palmPx = Math.hypot(m.x - w.x, m.y - w.y);
+    const r = Math.max(5, palmPx * 0.07);
+    const fontPx = Math.max(13, palmPx * 0.14);
+
+    // 手太小＝離鏡頭太遠，關鍵點誤差放大，提示靠近
+    if (palmPx < canvas.height * 0.10) notes.push("手離鏡頭有點遠，靠近一點會更準");
+
+    // 未選症狀不標點（症狀優先流程）
+    const pool = getActivePoints();
+    if (!pool.length) {
+      notes.push("請先在上方選擇症狀");
+      return;
+    }
+
+    // 依當前手面過濾穴位；角度太側判不出面向時整手不標（寧可不標不標錯）
+    if (side.uncertain) {
+      notes.push("角度太側判不出掌背面，請把掌心或手背正對鏡頭");
+      return;
+    }
+    const visible = pool.filter(p => p.side === side.name);
+    const hidden = pool.filter(p => p.side !== side.name);
+    if (!visible.length) {
+      notes.push(`${SIDE_ZH[side.name]}——這個症狀的穴位在另一面，請翻手（${hidden.map(p => p.name).join("、")}）`);
+      return;
+    }
+    notes.push(hidden.length
+      ? `${SIDE_ZH[side.name]}，翻手可見：${hidden.map(p => p.name).join("、")}`
+      : SIDE_ZH[side.name]);
+
+    // 腕旁標示目前判定的手面
+    ctx.font = `600 ${fontPx * 0.85}px -apple-system, "PingFang TC", sans-serif`;
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)";
+    ctx.strokeText(SIDE_ZH[side.name], w.x + 10, w.y + fontPx);
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText(SIDE_ZH[side.name], w.x + 10, w.y + fontPx);
+
+    visible.forEach((p, i) => {
+      const raw = toCanvas(p.calc(lm));
+      const pos = useSmoothing ? smooth(`${hi}-${p.id}`, raw) : raw;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = p.color + "cc";
+      ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
+      ctx.font = `600 ${Math.max(12, palmPx * 0.115)}px -apple-system, "PingFang TC", sans-serif`;
+      ctx.textBaseline = "middle";
+      // 標籤左右交錯，減少腕部密集區重疊
+      const left = i % 2 === 1;
+      ctx.textAlign = left ? "right" : "left";
+      const tx = left ? pos.x - r - 5 : pos.x + r + 5, ty = pos.y;
+      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(p.name, tx, ty);
+      ctx.fillStyle = "#fff"; ctx.fillText(p.name, tx, ty);
+    });
+    ctx.textAlign = "left";
+  });
+  return { drawn, notes };
+}
+
+// ---- 引導輪廓：沒偵測到手時顯示，導引使用者把部位放進畫面 ----
+let guidePhase = 0;
+function drawGuide() {
+  const cw = canvas.width, ch = canvas.height;
+  if (!cw || !ch) return;
+  guidePhase += 0.05;
+  const pulse = 0.16 + 0.08 * Math.sin(guidePhase);   // 緩慢呼吸感
+  ctx.save();
+
+  // 虛線引導框：同時受寬高限制，直式/橫式舞台都不爆框
+  const rw = Math.min(cw * 0.78, ch * 0.6);
+  const rh = Math.min(ch * 0.84, rw * 1.4);
+  const rx = (cw - rw) / 2, ry = (ch - rh) * 0.35;
+  ctx.setLineDash([12, 9]);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = `rgba(79, 195, 161, ${pulse + 0.3})`;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(rx, ry, rw, rh, 26); else ctx.rect(rx, ry, rw, rh);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 半透明手形輪廓（系統手形符號當剪影）
+  ctx.globalAlpha = pulse;
+  ctx.font = `${Math.round(Math.min(rh * 0.62, rw * 0.9))}px -apple-system, "Apple Color Emoji", sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("🖐", cw / 2, ry + rh * 0.46);
+  ctx.globalAlpha = 1;
+
+  // 提示文字
+  const fs = Math.max(14, Math.min(ch * 0.034, rw * 0.075));
+  ctx.font = `600 ${fs}px -apple-system, "PingFang TC", sans-serif`;
+  const hint = "把手放進框內，掌心或手背正對鏡頭";
+  const hx = cw / 2, hy = ry + rh - fs * 1.2;   // 框內底部，避免壓到狀態列
+  ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(hint, hx, hy);
+  ctx.fillStyle = "rgba(255,255,255,0.95)"; ctx.fillText(hint, hx, hy);
+
+  ctx.restore();
+}
+
+// ---- 即時鏡頭模式 ----
+// 預設後鏡頭（照自己的手或幫別人照）；facingMode 非強制，桌機只有一顆鏡頭也能開
+let facing = "environment";
+let mirrorLive = false;      // 前鏡頭才鏡像顯示
+async function startLive() {
+  if (!handLandmarker) return;
+  stopAll();
+  mode = "live";
+  video.classList.remove("hidden");
+  try {
+    await handLandmarker.setOptions({ runningMode: "VIDEO" });
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 960 } }
+    });
+    // 以實際拿到的鏡頭為準決定是否鏡像（要求後鏡頭但裝置只有前鏡頭時仍正確）
+    const actual = stream.getVideoTracks()[0]?.getSettings()?.facingMode;
+    mirrorLive = (actual ?? facing) === "user";
+    video.classList.toggle("mirrored", mirrorLive);
+    video.srcObject = stream;
+    video.addEventListener("loadeddata", () => {
+      statusEl.textContent = "請把手掌或手背舉到鏡頭前";
+      rafId = requestAnimationFrame(liveLoop);
+    }, { once: true });
+  } catch (err) {
+    statusEl.textContent = "鏡頭啟動失敗：" + err.message + "（此裝置可能沒有攝影機，可改用「上傳照片測試」）";
+    console.error(err);
+  }
+}
+
+let lastVideoTime = -1;
+function liveLoop() {
+  if (mode !== "live") return;
+  fitCanvas();
+  if (video.currentTime !== lastVideoTime && video.videoWidth) {
+    lastVideoTime = video.currentTime;
+    const result = handLandmarker.detectForVideo(video, performance.now());
+    lastResult = result;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const map = makeMapper(video.videoWidth, video.videoHeight, "cover", mirrorLive);
+    const res = drawHands(result, map, true);
+    if (res.drawn) {
+      statusEl.textContent = `偵測到 ${res.drawn} 隻手 · ${res.notes.join("；")}`;
+    } else {
+      drawGuide();
+      statusEl.textContent = "請把手放進畫面中的引導框";
+    }
+  }
+  rafId = requestAnimationFrame(liveLoop);
+}
+
+// ---- 照片模式 ----
+async function detectPhoto(img) {
+  stopAll();
+  mode = "photo";
+  photoImg = img;
+  video.classList.add("hidden");
+  fitCanvas();
+  if (!canvas.width || !canvas.height) {
+    // layout 尚未完成時稍候再試；不能只等 rAF（背景分頁不會觸發）
+    await new Promise(r => { requestAnimationFrame(r); setTimeout(r, 120); });
+    fitCanvas();
+    if (!canvas.width || !canvas.height) {         // 仍拿不到就用容器實際大小
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.round(rect.width) || 860);
+      canvas.height = Math.max(1, Math.round(rect.height) || 645);
+    }
+  }
+  await handLandmarker.setOptions({ runningMode: "IMAGE" });
+  const result = handLandmarker.detect(img);
+  lastResult = result;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const map = makeMapper(img.naturalWidth, img.naturalHeight, "contain", false);
+  const o = map({ x: 0, y: 0 }), s = map({ x: 1, y: 1 });
+  ctx.drawImage(img, o.x, o.y, s.x - o.x, s.y - o.y);
+  const res = drawHands(result, map, false);
+  statusEl.textContent = res.drawn
+    ? `照片中偵測到 ${res.drawn} 隻手 · ${res.notes.join("；")}`
+    : "照片中沒有偵測到手，換一張試試（手要清楚、光線足）";
+}
+
+function stopAll() {
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  smoothState.clear();
+  lastVideoTime = -1;
+}
+
+document.getElementById("btnLive").addEventListener("click", startLive);
+document.getElementById("btnFlip").addEventListener("click", () => {
+  facing = facing === "environment" ? "user" : "environment";
+  if (mode === "live" || !mode) startLive();
+});
+document.getElementById("btnPhoto").addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const f = fileInput.files?.[0];
+  fileInput.value = "";                     // 允許重選同一個檔案
+  if (!f) return;
+  statusEl.textContent = `讀取照片中…（${f.name}）`;
+  const img = new Image();
+  img.onload = () => detectPhoto(img).catch(err => {
+    statusEl.textContent = "偵測失敗：" + err.message;
+    console.error(err);
+  });
+  img.onerror = () => {
+    const isHeic = /\.hei[cf]$/i.test(f.name) || /hei[cf]/i.test(f.type);
+    statusEl.textContent = isHeic
+      ? "這是 HEIC 格式，瀏覽器無法解碼。請改用 JPEG/PNG（iPhone 可在「設定→相機→格式」選「最相容」，或分享時選存為 JPEG）"
+      : `照片讀取失敗（${f.name}，${f.type || "未知格式"}），請換 JPEG 或 PNG 試試`;
+  };
+  img.src = URL.createObjectURL(f);
+});
+skeletonToggle.addEventListener("change", () => { if (mode === "photo" && photoImg) detectPhoto(photoImg); });
+// 開發測試掛鉤，只在 ?debug 時暴露
+if (new URLSearchParams(location.search).has("debug")) {
+  window.__debug = { detectPhoto, getMode: () => mode, last: () => lastResult, handSide, drawGuide, fitCanvas };
+}
+
+// PWA：可加入主畫面、模型快取供離線使用
+if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
+  navigator.serviceWorker.register("./sw.js").catch(() => {});
+}
+
+loadModel()
+  .then(() => startLive())   // 預設先試鏡頭，失敗會提示改用照片
+  .catch(err => {
+    statusEl.textContent = "模型載入失敗：" + err.message;
+    console.error(err);
+  });
+</script>
+</body>
+</html>
