@@ -424,9 +424,13 @@ renderLegend();
 
 // ---- 對位層：平滑濾波（指數移動平均，抑制關鍵點抖動）----
 const smoothState = new Map();
-function smooth(key, pt, alpha = 0.4) {
+// maxJump：單幀位移超過此距離視為偵測雜訊（關鍵點跳到另一條腿），大幅降低跟隨速度
+function smooth(key, pt, alpha = 0.4, maxJump = Infinity) {
   const prev = smoothState.get(key);
-  const next = prev ? { x: prev.x + (pt.x - prev.x) * alpha, y: prev.y + (pt.y - prev.y) * alpha } : pt;
+  if (!prev) { smoothState.set(key, pt); return pt; }
+  const jumped = Math.hypot(pt.x - prev.x, pt.y - prev.y) > maxJump;
+  const a = jumped ? alpha * 0.2 : alpha;
+  const next = { x: prev.x + (pt.x - prev.x) * a, y: prev.y + (pt.y - prev.y) * a };
   smoothState.set(key, next);
   return next;
 }
@@ -678,10 +682,24 @@ function drawFeet(result, toCanvas, useSmoothing) {
     // 在畫布像素空間建座標系：正規化座標的 x/y 尺度不同，法向量會失真
     const px = pose.map(toCanvas);
 
-    for (const sideKey of ["left", "right"]) {
+    // 兩腿靠近時模型常把左右腳估到同一處，只留可信度較高的那隻，避免標記在兩腿間跳動
+    const vis = k => pose[k]?.visibility ?? 0;
+    const footScore = s => Math.min(vis(FOOT_IDX[s].ankle), vis(FOOT_IDX[s].heel), vis(FOOT_IDX[s].toe));
+    let sides = ["left", "right"].filter(s => footScore(s) >= 0.65);   // 門檻提高：遮擋的腳不標
+    if (sides.length === 2) {
+      const dx = px[FOOT_IDX.left.ankle].x - px[FOOT_IDX.right.ankle].x;
+      const dy = px[FOOT_IDX.left.ankle].y - px[FOOT_IDX.right.ankle].y;
+      const apart = Math.hypot(dx, dy);
+      const footLen = Math.hypot(px[FOOT_IDX.left.toe].x - px[FOOT_IDX.left.ankle].x,
+                                 px[FOOT_IDX.left.toe].y - px[FOOT_IDX.left.ankle].y);
+      if (apart < footLen * 0.8) {                 // 兩腳踝幾乎重疊 = 誤判
+        sides = [footScore("left") >= footScore("right") ? "left" : "right"];
+        notes.push("兩腳距離太近難以分辨，只標示較清楚的那隻（建議一次對準一隻腳）");
+      }
+    }
+
+    for (const sideKey of sides) {
       const i = FOOT_IDX[sideKey];
-      const vis = k => pose[k]?.visibility ?? 0;
-      if (Math.min(vis(i.ankle), vis(i.heel), vis(i.toe)) < 0.5) continue;   // 這隻腳沒看清就不標
       drawn++;
       if (!pool.length) continue;
 
@@ -718,7 +736,9 @@ function drawFeet(result, toCanvas, useSmoothing) {
 
       const items = visible.map(p => {
         const raw = p.calc(f);
-        return { p, pos: useSmoothing ? smooth(`${pi}-${sideKey}-${p.id}`, raw) : raw };
+        // 足部關鍵點抖動遠大於手部：平滑更重，且抑制跨腿的大跳動
+        return { p, pos: useSmoothing
+          ? smooth(`${pi}-${sideKey}-${p.id}`, raw, 0.22, f.len * 0.4) : raw };
       });
       for (const it of items) {
         it.place = placeLabel(it.p.name, it.pos, r, labelPx, boxes);
@@ -766,7 +786,7 @@ function drawGuide() {
   const fs = Math.max(14, Math.min(ch * 0.034, rw * 0.075));
   ctx.font = `600 ${fs}px -apple-system, "PingFang TC", sans-serif`;
   const hint = PART === "foot"
-    ? "讓小腿到腳一起入鏡，腳背朝鏡頭"
+    ? "坐著拍，一次一隻腳，連大腿一起入鏡"
     : "把手放進框內，掌心或手背正對鏡頭";
   const hx = cw / 2, hy = ry + rh - fs * 1.2;   // 框內底部，避免壓到狀態列
   ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.strokeText(hint, hx, hy);
@@ -825,7 +845,7 @@ function liveLoop() {
     } else {
       drawGuide();
       statusEl.textContent = PART === "foot"
-        ? "請讓小腿到腳一起入鏡（腳的偵測需要看到部分身體）"
+        ? "偵測不到腳：請坐著拍、一次一隻腳，並讓大腿或身體一起入鏡（模型靠軀幹定位）"
         : "請把手放進畫面中的引導框";
     }
   }

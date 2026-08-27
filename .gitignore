@@ -3,3 +3,4 @@ test_*.jpg
 test_*.jpeg
 test_*.png
 *_result.jpg
+overlap.jpg
