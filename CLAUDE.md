@@ -1,0 +1,66 @@
+# 穴位快找（acupoint-ar）
+
+用手機鏡頭即時標示穴位、依症狀取穴的保健輔助 PWA。單檔 `index.html`，
+偵測與運算全在瀏覽器端（MediaPipe tasks-vision 0.10.14 由 CDN 載入），**影像不上傳**。
+
+**已公開部署：https://clockhsu1976.github.io/acupoint-ar/ （repo `clockhsu1976/acupoint-ar`，
+GitHub Pages 從 `main` 佈）。更新方式＝commit 後 `git push`，沒有 build 步驟。**
+本機開發環境：LaunchAgent `com.clock.acupoint-ar` 跑 `python3 -m http.server 8123 --bind 127.0.0.1`
+（log `~/Library/Logs/acupoint-ar.log`），另有 `tailscale serve` 把它掛成 tailnet 限定的 HTTPS
+（網址用 `tailscale serve status` 查；**iPhone 實機測試一定要 HTTPS**，非 localhost 的 http
+拿不到鏡頭權限）。
+
+⚠️ 這是**公開 repo**：不要把使用者的測試照片、tailnet 網址、本機密鑰寫進任何檔案。
+測試照片放在 `~/projects/data/acupoint-ar-test/`（不在被伺服的目錄裡），`.gitignore`
+已擋 `test_*.jpg` 之類檔名。
+
+## 定位原理與四層架構
+
+穴位的「骨度分寸」定義 ≈ 關鍵點之間的比例插值，所以不需要自訓模型：
+資料（`ACUPOINTS` 陣列裡的定位公式）→ 視覺（裝置端偵測）→ 對位（插值＋EMA 平滑＋信心閘門）
+→ 呈現（疊加＋症狀查詢）。新增穴位＝在陣列加一筆公式，不改流程。
+
+目前 24 穴：手部 16（背側 9、掌側 7），足部 8。`PART` 切換手／足，症狀 chip 決定標哪些點，
+**預設不標點**——先選症狀再標，症狀在另一面時提示翻手、跨部位時提示「足部也有」。
+
+## 踩過的坑（照著做，不要重試已被否定的路）
+
+**PWA 快取**：`sw.js` 對頁面用 `fetch(req, {cache:"no-store"})`。原本沒加 `no-store`，
+會命中瀏覽器自己的 HTTP 快取，改版後一直跑舊頁面——**曾因此誤判「換模型無效」**。
+本機除錯要用唯一 query（`?bust=xxx`）；`?debug=1` 會直接註銷 SW 並暴露 `window.__debug`。
+CDN 的 wasm／模型檔走另一個快取（`acupoint-v1-assets`）快取優先，因為網址含版本號。
+
+**Pose 模型只能用 `full`**：`pose_landmarker_lite` 對「沒有頭部的下半身照」偵測結果是 0，
+且 `minPoseDetectionConfidence` 必須降到 0.25（0.5 會整個偵測不到）。
+
+**足部關鍵點不在解剖學位置**：MediaPipe 的 `foot_index` 實際落在腳背中段、`heel` 落在踝下方，
+**不可拿 heel→toe 當腳長**。改用「踝→foot_index」為單位向量外推。踝周圍穴（解谿/丘墟/崑崙/
+太谿）落點可用；腳背遠端（太衝/內庭）本質上偏，是方向估偏、調係數解不掉——所以足部畫的是
+虛線「概略範圍」而不是精確點。座標系必須建在**畫布像素空間**，正規化座標 x/y 尺度不同會讓
+法向量失真。`MEDIAL_SIGN=1` 已用真人照實測正確（太谿在內踝、崑崙在外踝）。
+
+**雙腿同框會把左右腳估到同一條腿**（兩輪使用者錄影都出現，第二輪是兩組穴位在同一條小腿
+上下排開，距離檢查抓不到這種失效）。最終方案：**一次只標 visibility 最高且 ≥0.6 的單腳**、
+移除左右腳標籤、平滑鍵值不含 sideKey、alpha 0.22 且跨腿大跳只跟 0.2 倍。
+少標的代價遠低於標錯腿——同樣的邏輯也用在手部的信心閘門（分數 <0.8 整隻手不標）。
+
+**掌背面判別**：外積 (腕→食指根)×(腕→小指根) 取符號配合 handedness；|sin|<0.12 視為側面不標。
+實測 tasks-vision 的 handedness label 對「未鏡像輸入」是解剖學正確的，故 `PALM_RULE.flipLabel=false`；
+live 模式的鏡像只做在 CSS 層，模型吃的是原始 frame，同一套規則通用。
+
+**iPhone 照片是 HEIC**，瀏覽器 `<img>` 解不了會無聲失敗（頁面已加錯誤提示）。
+本機轉檔：`sips -s format jpeg -Z 1600`。
+
+## 定位與紅線
+
+衛教／保健工具，誤差 1–2 公分，**不可宣稱醫療定位或作為針灸依據**。頁面有正式免責聲明
+（含孕婦按壓合谷的警語），改動文案時不要弄丟。腳底反射區**不做**：既沒有可商用的密集足部
+關鍵點模型（OpenPose 足部點是非商用授權），反射學也不等於中醫經絡，兩套資料／圖層／免責
+必須分開。BlazePose 官方說偵測器用臉當 ROI proxy、需要軀幹入鏡——實測純肢體特寫回傳 0 個 pose，
+這條路已經驗證走不通。
+
+## 待辦
+
+- 內關／外關目前用掌長 ×0.55 外推近似，落點偏遠端。正解是加 Pose 模型拿手肘關鍵點做真正的
+  骨度分寸，屆時兩穴一起校正。
+- 引導輪廓（沒偵測到時畫虛線框＋手形剪影）與「手太遠」提示已做在手部，其他部位模組要沿用同一套。
