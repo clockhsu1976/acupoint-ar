@@ -407,7 +407,7 @@ document.getElementById("parts").addEventListener("click", async e => {
     .forEach(b => b.classList.toggle("active", b.dataset.part === part));
   document.getElementById("subtitle").textContent = `${PART_ZH[part]}穴位・依症狀取穴`;
   renderLegend();
-  smoothState.clear();
+  clearFilters();
   try {
     if (part === "foot") await loadPose();
     if (mode === "live" && rafId) await activeDetector().setOptions({ runningMode: "VIDEO" });
@@ -433,6 +433,51 @@ function smooth(key, pt, alpha = 0.4, maxJump = Infinity) {
   const next = { x: prev.x + (pt.x - prev.x) * a, y: prev.y + (pt.y - prev.y) * a };
   smoothState.set(key, next);
   return next;
+}
+
+// One Euro filter：靜止時強去抖、快動時低延遲跟隨（AR 標記的標準濾波）。
+// 第三輪實測「還是會飄」的教訓：手持手機整個畫面常在動，固定 alpha 的重 EMA
+// 會讓標記永遠落後於腳，看起來就是慢慢飄走。速度自適應的截止頻率才能兩頭兼顧。
+function euroAlpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+const euroState = new Map();
+function euroFilter(key, pt, tMs, { minCutoff = 1.2, beta = 0.015, dCutoff = 1.0 } = {}) {
+  const st = euroState.get(key);
+  if (!st) { euroState.set(key, { t: tMs, x: pt.x, y: pt.y, dx: 0, dy: 0 }); return pt; }
+  const dt = Math.min(Math.max((tMs - st.t) / 1000, 1 / 120), 0.25);
+  const ad = euroAlpha(dCutoff, dt);
+  const dx = st.dx + ad * ((pt.x - st.x) / dt - st.dx);
+  const dy = st.dy + ad * ((pt.y - st.y) / dt - st.dy);
+  const a = euroAlpha(minCutoff + beta * Math.hypot(dx, dy), dt);
+  const next = { t: tMs, x: st.x + a * (pt.x - st.x), y: st.y + a * (pt.y - st.y), dx, dy };
+  euroState.set(key, next);
+  return { x: next.x, y: next.y };
+}
+
+// 單腳選擇的遲滯：可信度在門檻附近抖動時，選中的腳會左右輪替，穴位就在兩腿間游移
+// （第三輪「飄」的另一個主因）。進入門檻 0.6、維持門檻 0.5，挑戰者要連續 6 幀
+// 高出 0.15 才換腳；換腳或失格時清掉關鍵點濾波，避免跨腿平滑。
+let footPick = { side: null, challenger: null, streak: 0 };
+function pickFootSide(score) {
+  const cur = footPick.side;
+  if (cur && score[cur] >= 0.5) {
+    const other = cur === "left" ? "right" : "left";
+    if (score[other] >= 0.6 && score[other] - score[cur] >= 0.15) {
+      footPick.streak = footPick.challenger === other ? footPick.streak + 1 : 1;
+      footPick.challenger = other;
+      if (footPick.streak >= 6) { footPick = { side: other, challenger: null, streak: 0 }; euroState.clear(); }
+    } else { footPick.challenger = null; footPick.streak = 0; }
+    return footPick.side;
+  }
+  const best = ["left", "right"].filter(s => score[s] >= 0.6).sort((a, b) => score[b] - score[a])[0] ?? null;
+  if (best !== cur) euroState.clear();
+  footPick = { side: best, challenger: null, streak: 0 };
+  return best;
+}
+
+function clearFilters() {
+  smoothState.clear();
+  euroState.clear();
+  footPick = { side: null, challenger: null, streak: 0 };
 }
 
 let handLandmarker = null;
@@ -672,7 +717,7 @@ const LEG_BONES = [[25, 27], [26, 28], [27, 29], [28, 30], [29, 31], [30, 32], [
 
 function drawFeet(result, toCanvas, useSmoothing) {
   const poses = result?.landmarks ?? [];
-  if (!poses.length) { smoothState.clear(); return { drawn: 0, notes: [] }; }
+  if (!poses.length) { clearFilters(); return { drawn: 0, notes: [] }; }
   const notes = [];
   const boxes = [];
   let drawn = 0;
@@ -684,21 +729,30 @@ function drawFeet(result, toCanvas, useSmoothing) {
 
     // 一次只標「最可信的那隻腳」。雙腿同框時 pose 常把左右腳估到同一條腿上（實測：
     // 兩組穴位上下排在同一條小腿），距離檢查抓不到這種失效；而按摩本來就一次按一隻腳，
-    // 少標一隻的代價遠低於標錯腿。
+    // 少標一隻的代價遠低於標錯腿。選腳帶遲滯，避免門檻附近左右輪替。
     const vis = k => pose[k]?.visibility ?? 0;
     const footScore = s => Math.min(vis(FOOT_IDX[s].ankle), vis(FOOT_IDX[s].heel), vis(FOOT_IDX[s].toe));
-    const best = ["left", "right"]
-      .map(s => ({ s, v: footScore(s) }))
-      .filter(x => x.v >= 0.6)
-      .sort((a, b) => b.v - a.v)[0];
-    const sides = best ? [best.s] : [];
+    const picked = useSmoothing
+      ? pickFootSide({ left: footScore("left"), right: footScore("right") })
+      : (["left", "right"].filter(s => footScore(s) >= 0.6).sort((a, b) => footScore(b) - footScore(a))[0] ?? null);
+    const sides = picked ? [picked] : [];
 
     for (const sideKey of sides) {
       const i = FOOT_IDX[sideKey];
       drawn++;
       if (!pool.length) continue;
 
-      const f = footFrame(px, sideKey);
+      // 平滑做在「關鍵點」而非算完的穴位：整組穴位跟著同一個剛性框架移動，
+      // 不會各點以不同速率追趕、彼此相對位置變形（那也是一種飄）。
+      let framePose = px;
+      if (useSmoothing) {
+        const t = performance.now();
+        framePose = px.slice();
+        for (const idx of [i.knee, i.ankle, i.heel, i.toe]) {
+          framePose[idx] = euroFilter(`lm-${idx}`, px[idx], t);
+        }
+      }
+      const f = footFrame(framePose, sideKey);
       if (!(f.len > 12)) continue;                    // 腳太小，插值誤差過大
       const r = Math.max(5, f.len * 0.11);
       const labelPx = Math.max(12, f.len * 0.16);
@@ -723,13 +777,10 @@ function drawFeet(result, toCanvas, useSmoothing) {
       // 不標「左腳/右腳」：單腳顯示下使用者自己知道拍的是哪隻，而模型搞混左右時
       // 這個標籤反而給出錯誤資訊
 
-      const items = visible.map(p => {
-        const raw = p.calc(f);
-        // 足部關鍵點抖動遠大於手部：平滑更重，且抑制跨腿的大跳動。
-        // 鍵值不含 sideKey——單腳顯示下模型的左右判定會搖擺，鍵跟著換會讓平滑重置
-        return { p, pos: useSmoothing
-          ? smooth(`${pi}-foot-${p.id}`, raw, 0.22, f.len * 0.4) : raw };
-      });
+      // 穴位直接由已平滑的框架算出，不再做第二層 EMA（雙層平滑＝雙倍延遲）。
+      // 左右標籤搖擺時關鍵點索引會 27↔28 對調，濾波在新索引以當前位置重新起算，
+      // 物理位置沒變所以畫面不跳。
+      const items = visible.map(p => ({ p, pos: p.calc(f) }));
       for (const it of items) {
         it.place = placeLabel(it.p.name, it.pos, r, labelPx, boxes);
         boxes.push(it.place.box);
@@ -880,7 +931,7 @@ async function detectPhoto(img) {
 function stopAll() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-  smoothState.clear();
+  clearFilters();
   lastVideoTime = -1;
 }
 
@@ -912,7 +963,8 @@ skeletonToggle.addEventListener("change", () => { if (mode === "photo" && photoI
 // 開發測試掛鉤，只在 ?debug 時暴露
 if (new URLSearchParams(location.search).has("debug")) {
   window.__debug = { detectPhoto, getMode: () => mode, last: () => lastResult, handSide, drawGuide, fitCanvas,
-                     pose: () => poseLandmarker, loadPose, footFrame, FOOTPOINTS };
+                     pose: () => poseLandmarker, loadPose, footFrame, FOOTPOINTS,
+                     euroFilter, euroState, pickFootSide, getFootPick: () => footPick };
 }
 
 // PWA：可加入主畫面、模型快取供離線使用
