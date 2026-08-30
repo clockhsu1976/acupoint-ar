@@ -109,6 +109,7 @@
 
 <div id="controls">
   <button id="btnLive">📷 即時鏡頭</button>
+  <button id="btnSnap">📸 拍照定位</button>
   <button id="btnFlip">🔄 切換前後鏡頭</button>
   <button id="btnPhoto">🖼 上傳照片測試</button>
   <input type="file" id="fileInput" accept="image/*" hidden>
@@ -846,6 +847,7 @@ async function startLive() {
   stopAll();
   mode = "live";
   video.classList.remove("hidden");
+  canvas.style.touchAction = "";   // 離開照片檢視，還原頁面捲動
   try {
     await activeDetector().setOptions({ runningMode: "VIDEO" });
     stream = await navigator.mediaDevices.getUserMedia({
@@ -882,7 +884,10 @@ function liveLoop() {
     const res = PART === "foot" ? drawFeet(result, map, true) : drawHands(result, map, true);
     if (res.drawn) {
       const unit = PART === "foot" ? "隻腳" : "隻手";
-      statusEl.textContent = `偵測到 ${res.drawn} ${unit} · ${res.notes.join("；")}`;
+      // 足部即時追蹤會飄（3 個關鍵點的天花板），主打「拍照定位」
+      statusEl.textContent = PART === "foot"
+        ? `偵測到 ${res.drawn} ${unit} · 對準後按「📸 拍照定位」凍結細看（即時標記僅供對位參考）`
+        : `偵測到 ${res.drawn} ${unit} · ${res.notes.join("；")}`;
     } else {
       drawGuide();
       statusEl.textContent = PART === "foot"
@@ -894,11 +899,28 @@ function liveLoop() {
 }
 
 // ---- 照片模式 ----
-async function detectPhoto(img) {
+// 照片結果的檢視狀態（雙指縮放＋拖曳；偵測只跑一次，縮放只重繪）
+const photoView = { scale: 1, tx: 0, ty: 0 };
+function resetPhotoView() { photoView.scale = 1; photoView.tx = 0; photoView.ty = 0; }
+
+function renderPhoto() {
+  if (!photoImg || !lastResult) return { drawn: 0, notes: [] };
+  fitCanvas();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const base = makeMapper(photoImg.naturalWidth, photoImg.naturalHeight, "contain", false);
+  const v = photoView;
+  const map = p => { const q = base(p); return { x: q.x * v.scale + v.tx, y: q.y * v.scale + v.ty }; };
+  const o = map({ x: 0, y: 0 }), s = map({ x: 1, y: 1 });
+  ctx.drawImage(photoImg, o.x, o.y, s.x - o.x, s.y - o.y);
+  return PART === "foot" ? drawFeet(lastResult, map, false) : drawHands(lastResult, map, false);
+}
+
+async function detectPhoto(img, { fromSnap = false } = {}) {
   stopAll();
   mode = "photo";
   photoImg = img;
   video.classList.add("hidden");
+  canvas.style.touchAction = "none";        // 照片檢視要吃縮放/拖曳手勢，擋掉頁面捲動
   fitCanvas();
   if (!canvas.width || !canvas.height) {
     // layout 尚未完成時稍候再試；不能只等 rAF（背景分頁不會觸發）
@@ -915,17 +937,92 @@ async function detectPhoto(img) {
   await det.setOptions({ runningMode: "IMAGE" });
   const result = det.detect(img);
   lastResult = result;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const map = makeMapper(img.naturalWidth, img.naturalHeight, "contain", false);
-  const o = map({ x: 0, y: 0 }), s = map({ x: 1, y: 1 });
-  ctx.drawImage(img, o.x, o.y, s.x - o.x, s.y - o.y);
-  const res = PART === "foot" ? drawFeet(result, map, false) : drawHands(result, map, false);
+  resetPhotoView();
+  const res = renderPhoto();
   const unit = PART === "foot" ? "隻腳" : "隻手";
   statusEl.textContent = res.drawn
-    ? `照片中偵測到 ${res.drawn} ${unit} · ${res.notes.join("；")}`
+    ? (fromSnap
+        ? `已凍結標記（${res.drawn} ${unit}）· 雙指縮放、單指拖曳細看，雙擊還原；按「即時鏡頭」重拍 · ${res.notes.join("；")}`
+        : `照片中偵測到 ${res.drawn} ${unit} · 可雙指縮放細看 · ${res.notes.join("；")}`)
     : (PART === "foot"
-        ? "照片中沒有偵測到腳。腳的偵測需要看到部分身體（模型靠軀幹定位），試試拍到大腿或坐姿全身"
+        ? (fromSnap ? "這張沒偵測到腳，按「即時鏡頭」重拍：坐著、一次一隻腳、大腿一起入鏡"
+                    : "照片中沒有偵測到腳。腳的偵測需要看到部分身體（模型靠軀幹定位），試試拍到大腿或坐姿全身")
         : "照片中沒有偵測到手，換一張試試（手要清楚、光線足）");
+}
+
+// ---- 拍照定位：凍結一幀做靜態偵測（沒有追蹤就沒有飄），足部主打這條路 ----
+function snapFrame() {
+  if (mode !== "live" || !video.videoWidth) {
+    statusEl.textContent = "先按「即時鏡頭」對準部位，再按「拍照定位」凍結標記";
+    return;
+  }
+  const c = document.createElement("canvas");
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  // 不鏡像：掌背面判別（PALM_RULE）是以未鏡像輸入校準的，凍結畫面照片慣例呈現即可
+  c.getContext("2d").drawImage(video, 0, 0);
+  const img = new Image();
+  img.onload = () => detectPhoto(img, { fromSnap: true }).catch(err => {
+    statusEl.textContent = "拍照定位失敗：" + err.message;
+    console.error(err);
+  });
+  img.src = c.toDataURL("image/jpeg", 0.92);
+}
+
+// ---- 照片檢視手勢：雙指縮放、單指拖曳、雙擊還原 ----
+const activePointers = new Map();
+let pinchStart = null;      // { dist, scale, mid }
+let lastTapAt = 0;
+function canvasPoint(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function clampView() {
+  const v = photoView;
+  v.scale = Math.min(6, Math.max(1, v.scale));
+  v.tx = Math.min(0, Math.max(canvas.width * (1 - v.scale), v.tx));
+  v.ty = Math.min(0, Math.max(canvas.height * (1 - v.scale), v.ty));
+}
+canvas.addEventListener("pointerdown", e => {
+  if (mode !== "photo") return;
+  canvas.setPointerCapture(e.pointerId);
+  activePointers.set(e.pointerId, canvasPoint(e));
+  if (activePointers.size === 2) {
+    const [a, b] = [...activePointers.values()];
+    pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, scale: photoView.scale,
+                   mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
+  } else if (activePointers.size === 1) {
+    const now = performance.now();
+    if (now - lastTapAt < 300) { resetPhotoView(); renderPhoto(); }
+    lastTapAt = now;
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (mode !== "photo" || !activePointers.has(e.pointerId)) return;
+  const prev = activePointers.get(e.pointerId);
+  const cur = canvasPoint(e);
+  activePointers.set(e.pointerId, cur);
+  const v = photoView;
+  if (activePointers.size === 2 && pinchStart) {
+    const [a, b] = [...activePointers.values()];
+    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    const target = pinchStart.scale * (dist / pinchStart.dist);
+    const k = Math.min(6, Math.max(1, target)) / v.scale;
+    const m = pinchStart.mid;
+    v.tx = m.x - k * (m.x - v.tx);
+    v.ty = m.y - k * (m.y - v.ty);
+    v.scale *= k;
+    clampView(); renderPhoto();
+  } else if (activePointers.size === 1 && v.scale > 1) {
+    v.tx += cur.x - prev.x;
+    v.ty += cur.y - prev.y;
+    clampView(); renderPhoto();
+  }
+});
+for (const ev of ["pointerup", "pointercancel"]) {
+  canvas.addEventListener(ev, e => {
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) pinchStart = null;
+  });
 }
 
 function stopAll() {
@@ -940,6 +1037,7 @@ document.getElementById("btnFlip").addEventListener("click", () => {
   facing = facing === "environment" ? "user" : "environment";
   if (mode === "live" || !mode) startLive();
 });
+document.getElementById("btnSnap").addEventListener("click", snapFrame);
 document.getElementById("btnPhoto").addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
   const f = fileInput.files?.[0];
@@ -959,12 +1057,13 @@ fileInput.addEventListener("change", () => {
   };
   img.src = URL.createObjectURL(f);
 });
-skeletonToggle.addEventListener("change", () => { if (mode === "photo" && photoImg) detectPhoto(photoImg); });
+skeletonToggle.addEventListener("change", () => { if (mode === "photo" && photoImg) renderPhoto(); });
 // 開發測試掛鉤，只在 ?debug 時暴露
 if (new URLSearchParams(location.search).has("debug")) {
   window.__debug = { detectPhoto, getMode: () => mode, last: () => lastResult, handSide, drawGuide, fitCanvas,
                      pose: () => poseLandmarker, loadPose, footFrame, FOOTPOINTS,
-                     euroFilter, euroState, pickFootSide, getFootPick: () => footPick };
+                     euroFilter, euroState, pickFootSide, getFootPick: () => footPick,
+                     snapFrame, renderPhoto, photoView };
 }
 
 // PWA：可加入主畫面、模型快取供離線使用
